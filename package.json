@@ -1,0 +1,34 @@
+{
+  "name": "tix",
+  "version": "0.1.0",
+  "description": "Multi-agent coding orchestrator (SQLite + tmux + git worktrees)",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "tix": "./dist/cli/index.js"
+  },
+  "scripts": {
+    "build": "tsc -p .",
+    "dev": "tsx src/cli/index.ts",
+    "tix": "tsx src/cli/index.ts",
+    "lint": "tsc -p . --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "clean": "rm -rf dist"
+  },
+  "engines": {
+    "node": ">=24"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.7.0",
+    "commander": "^12.1.0",
+    "picocolors": "^1.1.1"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.12",
+    "@types/node": "^22.10.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2",
+    "vitest": "^4.1.5"
+  }
+}
