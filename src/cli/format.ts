@@ -13,6 +13,7 @@ const STATUS_COLOR: Record<IssueStatus, (s: string) => string> = {
   validate: pc.yellow,
   awaiting_human: pc.magenta,
   awaiting_pr: pc.green,
+  awaiting_merge: pc.green,
   done: pc.green,
   needs_input: pc.yellow,
   blocked: pc.red,

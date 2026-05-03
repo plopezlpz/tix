@@ -184,11 +184,31 @@ export const STATES: Record<IssueStatus, StateConfig> = {
     state: 'awaiting_pr',
     agent_role: 'publisher',
     prompt_file: 'prompts/pr.md',
-    on_done: 'done',
+    // Publisher's `tix done` advances to awaiting_merge — the branch is
+    // pushed and (ideally) a PR exists, but it hasn't been merged yet.
+    // Human runs `tix done <id>` after merging to advance to `done`.
+    on_done: 'awaiting_merge',
     on_request_revision: null,
     on_kickback: null,
     on_needs_input: 'needs_input',
     timeout_minutes: 15,
+    round_counter: null,
+    round_cap: null,
+    on_cap_reached: null,
+    cap_reached_reason: null,
+  },
+  awaiting_merge: {
+    // No agent role: this is a human-only state. The publisher has pushed
+    // the branch and (until we wire up a PR API) the human opens the PR
+    // manually, then runs `tix done <id>` once it's merged.
+    state: 'awaiting_merge',
+    agent_role: null,
+    prompt_file: null,
+    on_done: 'done',
+    on_request_revision: null,
+    on_kickback: null,
+    on_needs_input: 'needs_input',
+    timeout_minutes: null,
     round_counter: null,
     round_cap: null,
     on_cap_reached: null,

@@ -180,12 +180,16 @@ program
   .action((idArg: string, opts: { db: boolean; spawn: boolean }) => {
     const id = parseId(idArg);
     const issue = getIssue(id);
-    if (!['new', 'ready'].includes(issue.status)) {
+    if (issue.status === 'new') {
+      console.error(`refusing to claim #${id}: status is 'new'. Run \`tix status ${id} ready\` first to mark it claimable.`);
+      process.exit(1);
+    }
+    if (issue.status !== 'ready') {
       console.error(`refusing to claim #${id}: status is ${issue.status}`);
       process.exit(1);
     }
     const result = provision(id, { skipDb: !opts.db });
-    transitionManual(id, 'plan', 'claim');
+    transitionDone(id); // ready.on_done = 'plan'
     writeCurrentMd(id);
     console.log(`claimed #${id} → slot ${result.slot}`);
     console.log(`  worktree: ${result.worktreePath}`);

@@ -1,21 +1,15 @@
 ## Role: publisher
 
-Commit, push, link a PR. **Do not** re-evaluate the work — by the time you're spawned, validation and human approval already happened. Do not read `.tix/validation/test-results.md` (it may contain prior-round failure feedback that's now history).
+Commit + push, hand off to the human for merge. Don't re-evaluate prior work; don't read `.tix/validation/test-results.md` (may contain stale failure feedback).
 
-`.tix/` is gitignored at the repo level, so orchestration artifacts can't leak into the commit. You only need to handle real code changes. Use the base branch + remote listed in current.md (header line: `**Base:** …  |  **Remote:** …`):
+`.tix/` is gitignored; orchestration artifacts can't leak. `BASE`, `REMOTE`, `TITLE` come from current.md.
 
 ```sh
-BASE=<base from current.md>
-REMOTE=<remote from current.md>
-TITLE="<from .tix/current.md or the issue body>"
-
 git add -A
 
 COMMITS_AHEAD=$(git rev-list --count "$BASE"..HEAD)
-
 if [ "$COMMITS_AHEAD" -gt 1 ]; then
-  git reset --soft "$BASE"
-  git commit -m "$TITLE"
+  git reset --soft "$BASE" && git commit -m "$TITLE"
 elif [ "$COMMITS_AHEAD" -eq 1 ] && git diff --staged --quiet; then
   git commit --amend -m "$TITLE"
 else
@@ -25,10 +19,6 @@ fi
 git push -u "$REMOTE" "$(git branch --show-current)"
 ```
 
-After pushing, the host (Bitbucket / GitHub / GitLab / Gitea) usually prints a "Create pull request" URL — capture it and call:
+Capture the host's "Create PR" URL in your final message — the human reads it via `tix logs <id>`. Then `tix done <id>` (advances to `awaiting_merge`; the human runs `tix done` again after merging).
 
-```
-tix needs-input <id> "branch pushed; open PR/MR at <url>"
-```
-
-Don't merge. Don't force-push if anyone's already commented. Don't delete the branch.
+Don't merge. Don't force-push if commented. Don't delete the branch.

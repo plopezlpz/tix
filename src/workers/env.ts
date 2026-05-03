@@ -70,6 +70,8 @@ export function renderEnv(worktreePath: string, slot: number, opts: { force?: bo
       Object.entries(subs).map(([k, v]) => `${k}=${v}`).join('\n') + '\n';
     body += trailer;
   }
-  writeFileSync(outPath, body);
+  // 0o600: contains TIX_DATABASE_URL and any passthrough secrets from the
+  // template; should never be world-readable.
+  writeFileSync(outPath, body, { mode: 0o600 });
   return outPath;
 }

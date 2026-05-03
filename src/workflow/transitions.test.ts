@@ -7,7 +7,7 @@ import {
   whenKickback,
   whenRequestRevision,
 } from '../test-utils/given.js';
-import { transitionHumanVerdict, transitionNeedsInput, transitionResume } from './transitions.js';
+import { transitionHumanVerdict, transitionManual, transitionNeedsInput, transitionResume } from './transitions.js';
 import { getEvents } from '../db/queries.js';
 
 describe('plan loop', () => {
@@ -204,18 +204,104 @@ describe('resume from needs_input', () => {
   });
 });
 
+describe('publisher → done has an explicit awaiting_merge pause', () => {
+  it('awaiting_pr.done lands at awaiting_merge (PR pushed but not yet merged)', () => {
+    const { id } = givenIssue({ status: 'awaiting_pr' });
+    expect(whenDone(id).to).toBe('awaiting_merge');
+  });
+
+  it('awaiting_merge.done lands at done (human ran tix done after merging)', () => {
+    const { id } = givenIssue({ status: 'awaiting_merge' });
+    expect(whenDone(id).to).toBe('done');
+  });
+});
+
+describe('counter resets on every entry into a loop start state', () => {
+  it('entering code from awaiting_human (kickback) resets plan/code counters', () => {
+    const { id } = givenIssue({ status: 'awaiting_human', planRound: 2, codeRound: 3 });
+    whenKickback(id);
+    expect(getRounds(id)).toMatchObject({ plan: 0, code: 0 });
+  });
+
+  it('entering code from validate (request-revision) ALSO resets counters', () => {
+    const { id } = givenIssue({ status: 'validate', planRound: 2, codeRound: 3 });
+    whenRequestRevision(id);
+    expect(getRounds(id)).toMatchObject({ plan: 0, code: 0 });
+  });
+
+  it('entering code from plan_revise cap-forced advance resets counters', () => {
+    const { id } = givenIssue({ status: 'plan_review', planRound: 3, codeRound: 2 });
+    const r = whenRequestRevision(id);
+    expect(r.capReached).toBe(true);
+    expect(r.to).toBe('code');
+    expect(getRounds(id).plan).toBe(0);
+    expect(getRounds(id).code).toBe(0);
+  });
+});
+
+describe('cap-reached emits a single state_change to the cap target', () => {
+  it('does not record a phantom transition through the round-counter state', () => {
+    const { id } = givenIssue({
+      status: 'validate',
+      needsHumanValidation: true,
+      humanRound: 3,
+    });
+    const r = whenDone(id); // entering awaiting_human: round 4 > cap 3 → blocked
+    expect(r.to).toBe('blocked');
+    const events = getEvents(id);
+    // The cap-reached event should reference `from: validate` (the source of
+    // the move), NOT `from: awaiting_human` (which never settled).
+    const cap = events.find((e) => e.kind === 'cap_reached');
+    expect(cap?.data ?? '').toContain('"from":"validate"');
+    // No transition event landing at awaiting_human should appear.
+    const phantom = events.find(
+      (e) => e.kind === 'transition' && (e.data ?? '').includes('"to":"awaiting_human"'),
+    );
+    expect(phantom).toBeUndefined();
+  });
+
+  it('resets the bumped counter so manual restoration does not re-trip', () => {
+    const { id } = givenIssue({
+      status: 'validate',
+      needsHumanValidation: true,
+      humanRound: 3,
+    });
+    whenDone(id); // trips cap
+    expect(getRounds(id).human).toBe(0);
+  });
+});
+
+describe('manual transitions refuse counter-bearing targets', () => {
+  it('rejects manual move into plan_revise', () => {
+    const { id } = givenIssue({ status: 'plan_review' });
+    expect(() => transitionManual(id, 'plan_revise', 'force')).toThrow(/round-counter-bearing/);
+  });
+
+  it('rejects manual move into awaiting_human', () => {
+    const { id } = givenIssue({ status: 'validate' });
+    expect(() => transitionManual(id, 'awaiting_human', 'force')).toThrow(/round-counter-bearing/);
+  });
+
+  it('still allows non-counter targets like ready or blocked', () => {
+    const { id } = givenIssue({ status: 'plan' });
+    expect(() => transitionManual(id, 'ready', 'force')).not.toThrow();
+  });
+});
+
 describe('happy path end-to-end', () => {
-  it('walks plan → plan_review → code → code_review → validate → awaiting_pr without human val', () => {
+  it('walks plan → plan_review → code → code_review → validate → awaiting_pr → awaiting_merge → done (no human val)', () => {
     const { id } = givenIssue({ status: 'plan' });
     whenDone(id); // plan_review
     whenDone(id); // code
     whenDone(id); // code_review
     whenDone(id); // validate
-    whenDone(id); // → awaiting_pr (function-form on_done)
-    expect(getStatus(id)).toBe('awaiting_pr');
+    whenDone(id); // awaiting_pr (function-form on_done)
+    whenDone(id); // awaiting_merge (publisher pushed)
+    whenDone(id); // done (human merged)
+    expect(getStatus(id)).toBe('done');
   });
 
-  it('walks plan → plan_review → code → code_review → validate → awaiting_human with human val', () => {
+  it('walks plan → ... → validate → awaiting_human with human val', () => {
     const { id } = givenIssue({ status: 'plan', needsHumanValidation: true });
     whenDone(id);
     whenDone(id);

@@ -1,5 +1,5 @@
 import type Database from 'better-sqlite3';
-import type { Issue, IssueStatus } from '../types.js';
+import type { EventKind, Issue, IssueStatus } from '../types.js';
 import { getDb } from './index.js';
 
 export function now(): number {
@@ -8,7 +8,7 @@ export function now(): number {
 
 export function logEvent(
   issueId: number,
-  kind: string,
+  kind: EventKind,
   data?: Record<string, unknown> | null,
 ): void {
   const db = getDb();
@@ -151,6 +151,19 @@ export function getEvents(issueId: number, limit = 50): Array<{ kind: string; da
   return db
     .prepare('SELECT kind, data, at FROM events WHERE issue_id = ? ORDER BY at DESC LIMIT ?')
     .all(issueId, limit) as Array<{ kind: string; data: string | null; at: number }>;
+}
+
+/** Most recent event of a given kind, regardless of how far back it lives. */
+export function findLatestEvent(
+  issueId: number,
+  kind: string,
+): { kind: string; data: string | null; at: number } | undefined {
+  const db = getDb();
+  return db
+    .prepare(
+      'SELECT kind, data, at FROM events WHERE issue_id = ? AND kind = ? ORDER BY at DESC LIMIT 1',
+    )
+    .get(issueId, kind) as { kind: string; data: string | null; at: number } | undefined;
 }
 
 export function withTransaction<T>(fn: (db: Database.Database) => T): T {

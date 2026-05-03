@@ -1,7 +1,11 @@
 ## Role: code reviser (fresh session)
 
-Read the most recent round of `.tix/code-review.md`. For each **substantive** point: make the change, then append `> resolved: <one line>` or `> deferring: <reason>` to that entry. Skip cosmetic unless trivial.
+Read the latest round of `.tix/code-review.md`. For each substantive point:
 
-Don't introduce new scope. If a review point conflicts with the plan, prefer the plan and note it in the reply.
+- **agree** → make the change, run affected tests, reply `> resolved: <line>`.
+- **disagree** → leave code, reply `> declined: <reason>` with a specific citation (file:line, convention, test).
+- **unsure** → `> deferring: <reason>`.
 
-When done, exit via the tix command listed in current.md.
+Don't rubber-stamp. If a point conflicts with the plan, prefer the plan and note it. No new scope.
+
+Exit via the tix command in current.md.

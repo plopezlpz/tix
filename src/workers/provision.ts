@@ -3,7 +3,7 @@ import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, statSy
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { assertRepoPathIsGitRepo, getConfig } from '../config.js';
-import type { IssueStatus } from '../types.js';
+import type { Issue, IssueStatus } from '../types.js';
 import { getStateConfig, validExits as stateValidExits } from '../workflow/states.js';
 
 const PROMPTS_DIR = join(dirname(fileURLToPath(import.meta.url)), '../../prompts');
@@ -30,6 +30,8 @@ export function provision(issueId: number, opts: { skipDb?: boolean } = {}): Pro
   assertRepoPathIsGitRepo();
   const issue = getIssue(issueId);
 
+  // Acquire the slot first, then immediately persist `issues.slot` so a crash
+  // anywhere downstream still leaves a recoverable state for `tix release`.
   let slot: number;
   if (issue.slot != null) {
     slot = issue.slot;
@@ -43,10 +45,14 @@ export function provision(issueId: number, opts: { skipDb?: boolean } = {}): Pro
     }
     slot = claimed.slot;
     logEvent(issueId, 'slot_claimed', { slot });
+    updateIssue(issueId, { slot });
   }
 
   const spec = worktreeFor(issueId);
   ensureWorktree(issueId);
+  // Persist worktree paths early too, so a crash before the final updateIssue
+  // still allows deprovision to find them.
+  updateIssue(issueId, { worktree_path: spec.path, branch: spec.branch });
 
   // Per-issue subdirs the agents will write into. All under .tix/ so they
   // never appear at the worktree root and never pollute `git status`.
@@ -54,12 +60,9 @@ export function provision(issueId: number, opts: { skipDb?: boolean } = {}): Pro
   mkdirSync(tx.root, { recursive: true });
   mkdirSync(tx.validationDir, { recursive: true });
 
-  // Render env (no-op-friendly: overwrites rendered file each call).
-  try {
-    renderEnv(spec.path, slot);
-  } catch (err) {
-    logEvent(issueId, 'env_render_failed', { error: String(err) });
-  }
+  // Env render: rethrow on failure. A misconfigured / unrenderable env is the
+  // production-data-corruption path (agent runs against the wrong DB).
+  renderEnv(spec.path, slot);
 
   if (!opts.skipDb) {
     try {
@@ -72,65 +75,78 @@ export function provision(issueId: number, opts: { skipDb?: boolean } = {}): Pro
 
   const session = sessionName(issueId);
   ensureSession(session, spec.path);
+  updateIssue(issueId, { tmux_session: session });
 
   // Pre-create .tix/agent.log so the spawn command's tee/append always lands.
   mkdirSync(join(spec.path, '.tix'), { recursive: true });
   const logPath = agentLogPath(spec.path);
   if (!existsSync(logPath)) writeFileSync(logPath, '');
 
-  // Worktree-local gitignore for orchestration artifacts. Belt-and-suspenders:
-  // the publisher prompt also excludes these, but ignoring them at the worktree
-  // level prevents an over-eager `git add .` from sneaking them into a commit.
   writeWorktreeGitignore(spec.path);
-
-  // Sync the live AGENTS.md / CLAUDE.md from the main repo's working tree to
-  // the worktree, so uncommitted policy edits on master propagate without
-  // needing a master commit. Idempotent.
   syncAgentsMd(spec.path);
-
-  // Pre-approve tix and other safe commands so the agent isn't blocked on prompts.
   writeClaudeSettings(spec.path);
-
-  // Write current.md as the agent's hot cache.
   writeCurrentMd(issueId);
-
-  updateIssue(issueId, {
-    slot,
-    worktree_path: spec.path,
-    branch: spec.branch,
-    tmux_session: session,
-  });
 
   return { slot, worktreePath: spec.path, branch: spec.branch, tmuxSession: session };
 }
 
-/** Tear down everything tied to the issue. */
+/**
+ * Tear down everything tied to the issue. Best-effort per-resource: a
+ * failure on one teardown step (e.g. dropSlotDb) doesn't mask state for the
+ * others. Columns are nulled only when the matching resource was actually
+ * cleaned, so a partial release leaves a recoverable shape.
+ *
+ * Slot resolution: prefers `issue.slot`, but falls back to the slots table
+ * (in case provision crashed before persisting `issues.slot`).
+ */
 export function deprovision(issueId: number, opts: { skipDb?: boolean; force?: boolean } = {}): void {
   const issue = getIssue(issueId);
-  if (issue.slot != null) {
+  const slot = issue.slot ?? findSlotByIssueId(issueId);
+  const failures: string[] = [];
+  const patch: Partial<Issue> = { agent_state: null };
+
+  if (slot != null) {
     if (!opts.skipDb) {
       try {
-        dropSlotDb(issue.slot, { ifExists: true });
+        dropSlotDb(slot, { ifExists: true });
       } catch (err) {
+        failures.push('db');
         logEvent(issueId, 'db_drop_failed', { error: String(err) });
       }
     }
-    killSession(sessionName(issueId));
-    releaseSlot(issue.slot);
-    logEvent(issueId, 'slot_released', { slot: issue.slot });
+    try {
+      killSession(sessionName(issueId));
+      patch.tmux_session = null;
+    } catch (err) {
+      failures.push('tmux');
+      logEvent(issueId, 'tmux_kill_failed', { error: String(err) });
+    }
+    releaseSlot(slot);
+    patch.slot = null;
+    logEvent(issueId, 'slot_released', { slot });
   }
+
   try {
     removeWorktree(issueId, { force: opts.force ?? false });
+    patch.worktree_path = null;
+    patch.branch = null;
   } catch (err) {
+    failures.push('worktree');
     logEvent(issueId, 'worktree_remove_failed', { error: String(err) });
   }
-  updateIssue(issueId, {
-    slot: null,
-    worktree_path: null,
-    branch: null,
-    tmux_session: null,
-    agent_state: null,
-  });
+
+  updateIssue(issueId, patch);
+  if (failures.length > 0) {
+    throw new Error(
+      `partial release for #${issueId}: ${failures.join(', ')} teardown failed; ` +
+        `corresponding fields preserved on the issue. See timeline for details.`,
+    );
+  }
+}
+
+function findSlotByIssueId(issueId: number): number | null {
+  const row = listSlots().find((s) => s.issue_id === issueId);
+  return row ? row.slot : null;
 }
 
 /** Resolve all tix orchestration paths, all under `.tix/`. */
@@ -180,39 +196,21 @@ export function writeCurrentMd(issueId: number): void {
     '',
     issue.body,
     '',
+    ...arrivalContextSection(issue.id),
     ...recentHumanAnswerSection(issue.id),
-    '## How tix works (read this once)',
+    '## How tix works',
     '',
-    'You are running inside a tix orchestrator worktree. Each state spawns a fresh agent (you) that reads only the files in this worktree — there is no continuity from any prior session. Author and critic are intentionally different sessions: read artifacts cold, no memory of what anyone else "intended".',
+    'Each state spawns a fresh agent. No continuity from prior sessions: read artifacts cold. Author and critic are different sessions on purpose.',
     '',
-    'For project conventions — code style, hard rules, sensitive paths, domain knowledge — read `AGENTS.md` / `CLAUDE.md` / `README.md` at the worktree root. Tix does not embed project-specific guidance; the project owns that.',
+    'Project conventions live in `AGENTS.md` / `CLAUDE.md` / `README.md` at the worktree root. Real project files at the worktree root; tix files under `.tix/` (gitignored): `plan.md`, `plan-critique.md`, `code-review.md`, `validation/{test-plan,test-results}.md`, `agent.log`.',
     '',
-    '**Tix orchestration files** (all under `.tix/`, gitignored — they never enter commits):',
+    'Slot env in `.env`: `${TIX_PG_DBNAME}`, `${TIX_API_PORT}`, `${TIX_FRONTEND_PORT}`, `${TIX_REDIS_DB}`. Round caps: 3 review/revise iterations before force-advance. Humans merge.',
     '',
-    '- `.tix/current.md` — this file (your hot cache; role for the current state at the bottom)',
-    '- `.tix/plan.md` — the plan (planner writes, reviser updates)',
-    '- `.tix/plan-critique.md` — accumulating critique (critic appends `## Round N`)',
-    '- `.tix/code-review.md` — accumulating code review',
-    '- `.tix/validation/test-plan.md` — written by validator for human verification',
-    '- `.tix/validation/test-results.md` — written by the human',
-    '- `.tix/agent.log` — your own stream tee (read via `tix logs`)',
-    '',
-    'Real project files (the actual change you are making) live at the **worktree root**, NOT under `.tix/`.',
-    '',
-    '**Slot environment** is in `.env`: DB `${TIX_PG_DBNAME}`, API on `${TIX_API_PORT}`, frontend on `${TIX_FRONTEND_PORT}`, redis logical DB `${TIX_REDIS_DB}`.',
-    '',
-    '**Round caps are 3.** Plan/code review caps force-advance with unresolved points captured in the critique file. Human-validation cap blocks for triage. At round 3 with substantive issues, file them clearly — do not loop.',
-    '',
-    '**Humans on the merge button.** You may open PRs but never merge.',
-    '',
-    '## Acting on this state',
-    '',
-    'When you finish your work, you MUST call exactly one of:',
+    '## Exit (call exactly one)',
     '',
     ...validExitsMarkdown(issue.status, issue.id),
     '',
-    'Do not call any other tix transition command from this state — they will fail.',
-    'Do not exit the session without making one of those calls.',
+    'Other transitions from this state will fail.',
     '',
   ];
 
@@ -388,13 +386,13 @@ export function writeClaudeSettings(worktreePath: string): void {
 }
 
 /**
- * Copy AGENTS.md (and CLAUDE.md if it's a symlink/copy) from the main repo's
- * working tree to the worktree. Lets policy edits on master propagate to all
- * agent worktrees without a commit on master.
+ * Copy AGENTS.md (and CLAUDE.md if present) from the main repo's working tree
+ * to the worktree. Lets policy edits on master propagate to all agent
+ * worktrees without a commit.
  *
- * Skips silently if the source files don't exist or the worktree path matches
- * the main repo (no copy needed). Only copies when the destination is missing
- * or the source is newer — avoids clobbering edits made inside the worktree.
+ * Hash-compares contents to decide whether to write. mtime alone is too
+ * sensitive (a `touch` or `git checkout` bumps mtime without changing
+ * content; we'd then clobber legitimate worktree edits).
  */
 export function syncAgentsMd(worktreePath: string): void {
   const cfg = getConfig();
@@ -404,13 +402,17 @@ export function syncAgentsMd(worktreePath: string): void {
     const dst = join(worktreePath, name);
     if (!existsSync(src)) continue;
     try {
+      const srcContent = readFileSync(src, 'utf8');
       if (existsSync(dst)) {
-        const sStat = statSync(src);
-        const dStat = statSync(dst);
-        if (sStat.mtimeMs <= dStat.mtimeMs) continue;
+        const dstContent = readFileSync(dst, 'utf8');
+        // Skip if dst already matches src OR if dst differs and src isn't
+        // actually newer in *content*. Either way, no clobber.
+        if (dstContent === srcContent) continue;
+        // dst differs from src — could be a worktree-local edit. Don't
+        // overwrite. The user can manually copy if they want to sync.
+        continue;
       }
-      const content = readFileSync(src, 'utf8');
-      writeFileSync(dst, content);
+      writeFileSync(dst, srcContent);
     } catch {
       // best-effort; don't block provision
     }
@@ -418,15 +420,52 @@ export function syncAgentsMd(worktreePath: string): void {
 }
 
 /**
- * If the issue was just resumed from `needs_input`, surface the most recent
+ * Surface the most recent state-changing event so the agent knows whether
+ * it arrived by approval, by cap-forced advance, or by human kickback.
+ * Different arrivals carry different priorities — a cap-reached coder needs
+ * to read `.tix/plan-critique.md` for unresolved items first.
+ */
+function arrivalContextSection(issueId: number): string[] {
+  const events = getEvents(issueId, 20);
+  const STATE_KINDS = new Set(['transition', 'manual', 'resumed', 'cap_reached', 'blocked']);
+  const evt = events.find((e) => STATE_KINDS.has(e.kind));
+  if (!evt) return [];
+  if (evt.kind === 'cap_reached') {
+    const reason = parseField(evt.data, 'reason') ?? 'round cap reached';
+    return [
+      '## How you arrived here',
+      '',
+      `**Cap-forced advance.** ${reason}.`,
+      'Read the relevant critique/review file (`.tix/plan-critique.md` or `.tix/code-review.md`) — there are unresolved points the previous loop didn’t close. Prioritise the substantive ones; ignore the cosmetic.',
+      '',
+    ];
+  }
+  if (evt.kind === 'resumed') {
+    return [
+      '## How you arrived here',
+      '',
+      'Resumed from a paused `needs_input`. The human’s answer is below — read it before continuing.',
+      '',
+    ];
+  }
+  return [];
+}
+
+/**
+ * If the issue was *just* resumed from `needs_input`, surface the most recent
  * pending question + human answer so the freshly-spawned agent has both
- * without scrolling the events log.
+ * without scrolling the events log. Once any subsequent transition happens,
+ * the Q&A is considered consumed and we stop showing it.
  */
 function recentHumanAnswerSection(issueId: number): string[] {
   const events = getEvents(issueId, 50);
-  // Walk newest → oldest; collect the latest needs_input + the latest
-  // human_answer that came after it. If we hit a `resumed` event, the answer
-  // has already been consumed in a previous resume — stop.
+  // The Q&A is current ONLY if the most recent state-changing event is a
+  // `resumed`. Any newer transition means the agent already saw it and
+  // moved on; re-injecting it is misleading.
+  const STATE_KINDS = new Set(['transition', 'manual', 'resumed', 'cap_reached', 'blocked']);
+  const latestStateChange = events.find((e) => STATE_KINDS.has(e.kind));
+  if (!latestStateChange || latestStateChange.kind !== 'resumed') return [];
+
   let question: string | null = null;
   let answer: string | null = null;
   for (const e of events) {
@@ -541,11 +580,7 @@ export function spawnAgent(issueId: number, opts: { delaySeconds?: number } = {}
 }
 
 function buildKickoff(issue: ReturnType<typeof getIssue>): string {
-  return (
-    `Read .tix/current.md first — it has your role for the current state (${issue.status}), ` +
-    `the workflow rules, and the exact tix command(s) you are allowed to call when finished. ` +
-    `Then do that work. Do not exit without calling one of the listed tix commands.`
-  );
+  return `Read .tix/current.md and follow it. State: ${issue.status}. Don't exit without calling one of the tix commands listed there.`;
 }
 
 /**
@@ -560,8 +595,12 @@ function buildKickoff(issue: ReturnType<typeof getIssue>): string {
 function scheduleDetachedRespawn(session: string, command: string, delaySeconds: number): void {
   const target = shQuote(session);
   const cmd = shQuote(command);
+  // Bail out if the session has been killed (release-then-claim within the
+  // delay window). Sessions are per-issue, so even a recycled slot has a
+  // different name — but the existence check costs nothing extra.
   const script =
     `sleep ${delaySeconds}; ` +
+    `tmux has-session -t ${target} 2>/dev/null || exit 0; ` +
     `tmux send-keys -t ${target} -l ${cmd}; ` +
     `tmux send-keys -t ${target} Enter`;
   const child = spawn('sh', ['-c', script], {

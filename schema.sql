@@ -7,18 +7,24 @@ CREATE TABLE IF NOT EXISTS issues (
   title TEXT NOT NULL,
   body TEXT NOT NULL,
   status TEXT NOT NULL DEFAULT 'new',
+  -- group_id: TODO Phase 2 — bundle related issues that share a parent doc.
+  -- Currently unused; kept as a column so the future feature doesn't need
+  -- a migration.
   group_id TEXT,
   worktree_path TEXT,
   branch TEXT,
   tmux_session TEXT,
   slot INTEGER,
+  -- agent_state / agent_state_at: TODO Phase 3 — populated by the daemon
+  -- from tmux pane activity (working / waiting_input / idle / crashed).
   agent_state TEXT,
   agent_state_at INTEGER,
   needs_human_validation INTEGER NOT NULL DEFAULT 0,
   plan_review_round INTEGER NOT NULL DEFAULT 0,
   code_review_round INTEGER NOT NULL DEFAULT 0,
   human_validation_round INTEGER NOT NULL DEFAULT 0,
-  retry_count INTEGER NOT NULL DEFAULT 0,
+  -- pr_url: TODO Phase 2 — set by the publisher once a host PR API is wired.
+  -- Read by `tix show`; currently always null.
   pr_url TEXT,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL

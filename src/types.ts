@@ -19,6 +19,7 @@ export type IssueStatus =
   | 'validate'
   | 'awaiting_human'
   | 'awaiting_pr'
+  | 'awaiting_merge'
   | 'done'
   | 'needs_input'
   | 'blocked';
@@ -45,7 +46,6 @@ export interface Issue {
   plan_review_round: number;
   code_review_round: number;
   human_validation_round: number;
-  retry_count: number;
   pr_url: string | null;
   created_at: number;
   updated_at: number;
@@ -73,3 +73,24 @@ export type TransitionKind =
   | 'block'
   | 'cap_reached'
   | 'manual';
+
+/** Every kind value `logEvent` accepts. Centralised so a typo is a type error. */
+export type EventKind =
+  | 'created'
+  | 'status_change'
+  | 'transition'
+  | 'manual'
+  | 'cap_reached'
+  | 'needs_input'
+  | 'human_answer'
+  | 'resumed'
+  | 'blocked'
+  | 'slot_claimed'
+  | 'slot_released'
+  | 'env_render_failed'
+  | 'db_create_failed'
+  | 'db_drop_failed'
+  | 'tmux_kill_failed'
+  | 'worktree_remove_failed'
+  | 'agent_spawned'
+  | 'agent_respawn_scheduled';

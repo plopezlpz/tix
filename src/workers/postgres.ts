@@ -28,15 +28,20 @@ export function createSlotDb(slot: number): string {
 export function dropSlotDb(slot: number, opts: { ifExists?: boolean } = {}): void {
   const cfg = getConfig();
   const dbName = `${cfg.postgres.prefix}${slot}`;
-  // Terminate active connections first.
-  run('psql', psqlArgs([
-    '-d', 'postgres',
-    '-c', `SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '${escapeLit(dbName)}' AND pid <> pg_backend_pid();`,
-  ]), { allowFail: true });
-  const stmt = opts.ifExists
+  // Single transaction: block new connections, kick existing ones, drop. A
+  // two-call version raced when a fast pg pool reconnect snuck in between
+  // pg_terminate_backend and DROP DATABASE.
+  const dropStmt = opts.ifExists
     ? `DROP DATABASE IF EXISTS ${quoteIdent(dbName)};`
     : `DROP DATABASE ${quoteIdent(dbName)};`;
-  run('psql', psqlArgs(['-d', 'postgres', '-c', stmt]), { allowFail: opts.ifExists });
+  const script =
+    `ALTER DATABASE ${quoteIdent(dbName)} ALLOW_CONNECTIONS false;` +
+    `SELECT pg_terminate_backend(pid) FROM pg_stat_activity ` +
+    `WHERE datname = '${escapeLit(dbName)}' AND pid <> pg_backend_pid();` +
+    dropStmt;
+  // ALTER + terminate may fail if the DB doesn't exist; that's fine when
+  // ifExists is true. Allow the whole script to fail in that case.
+  run('psql', psqlArgs(['-d', 'postgres', '-c', script]), { allowFail: opts.ifExists });
 }
 
 /** Refresh the template from the live dev DB. Call manually when stale. */

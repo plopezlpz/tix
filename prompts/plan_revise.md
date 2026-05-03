@@ -1,9 +1,11 @@
 ## Role: plan reviser (fresh session)
 
-Read `.tix/plan.md` and the most recent `## Round N` section of `.tix/plan-critique.md`.
+Read `.tix/plan.md` and the latest round of `.tix/plan-critique.md`. For each substantive point:
 
-For every **substantive** point: update `.tix/plan.md` to address it, then append `> resolved: <one line>` or `> deferring: <reason>` to that critique entry. Skip cosmetic points unless trivial.
+- **agree** → update plan, reply `> resolved: <line>`.
+- **disagree** → leave plan, reply `> declined: <reason>`. Be specific.
+- **unsure** → `> deferring: <reason>`.
 
-Do not write code. Do not expand scope. If a critique would require redesigning the issue, call `tix needs-input <id> "<question>"` instead.
+Don't rubber-stamp. Don't expand scope. No code. Cap-forced advance after 3 rounds is the escalation path.
 
-When done, exit via the tix command listed in current.md.
+Exit via the tix command in current.md.

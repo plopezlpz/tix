@@ -1,4 +1,5 @@
 import {
+  findLatestEvent,
   getEvents,
   getIssue,
   incrementRound,
@@ -8,6 +9,7 @@ import {
   withTransaction,
 } from '../db/queries.js';
 import type { Issue, IssueStatus } from '../types.js';
+import type { RoundCounter } from './states.js';
 import { getStateConfig, isTerminal, resolveTransition, STATES, validExits } from './states.js';
 
 export interface TransitionResult {
@@ -17,35 +19,62 @@ export interface TransitionResult {
   reason?: string;
 }
 
+/**
+ * Loop-entry states: when an issue *enters* one of these from outside the
+ * loop, the loop's counters reset so the next review/revise cycle gets a
+ * fresh budget. Generalises the old kickback-only reset to also cover the
+ * validate-requests-revision-back-to-code path.
+ */
+const LOOP_RESETS: Partial<Record<IssueStatus, RoundCounter[]>> = {
+  plan: ['plan_review_round'],
+  code: ['plan_review_round', 'code_review_round'],
+};
+
 function move(issue: Issue, to: IssueStatus, extra?: { reason?: string }): TransitionResult {
-  // Wrap the whole status-change + counter-bump + cap-trip in a single tx so
-  // a crash mid-sequence can't leave the issue parked above its cap.
   return withTransaction(() => {
     const from = issue.status;
-    setStatus(issue.id, to);
-    logEvent(issue.id, 'transition', { from, to, ...(extra ?? {}) });
-
-    // After landing in `to`, see if `to` itself has a round counter to bump.
-    // Round counters increment on entry to the revise/validated states so the
-    // cap covers the *number of attempts*, not the number of approvals.
     const incoming = getStateConfig(to);
+
+    // Decide whether the cap will trip BEFORE writing any status, so a capped
+    // move emits a single status_change → on_cap_reached and never a phantom
+    // intermediate transition through `to` itself.
+    let target = to;
+    let capped = false;
+    let capRound: number | undefined;
+    let capReason: string | undefined;
+
     if (incoming.round_counter) {
       const round = incrementRound(issue.id, incoming.round_counter);
       if (incoming.round_cap != null && round > incoming.round_cap && incoming.on_cap_reached) {
-        const capTarget = incoming.on_cap_reached;
-        const reason = incoming.cap_reached_reason ?? 'round cap reached';
-        setStatus(issue.id, capTarget);
-        logEvent(issue.id, 'cap_reached', {
-          from: to,
-          to: capTarget,
-          round,
-          cap: incoming.round_cap,
-          reason,
-        });
-        return { from, to: capTarget, capReached: true, reason };
+        target = incoming.on_cap_reached;
+        capped = true;
+        capRound = round;
+        capReason = incoming.cap_reached_reason ?? 'round cap reached';
+        // Reset the just-bumped counter — it's logically out of bounds, and
+        // leaving it set would re-trip the cap on a manual restoration.
+        resetRoundCounters(issue.id, [incoming.round_counter]);
       }
     }
-    return { from, to, capReached: false };
+
+    // Reset loop counters when entering a loop's start state from outside it.
+    // Covers kickback (awaiting_human → code), validate-requests-revision
+    // (validate → code), and the plan_revise-cap forced advance to code.
+    const resets = LOOP_RESETS[target];
+    if (resets) resetRoundCounters(issue.id, resets);
+
+    setStatus(issue.id, target);
+    if (capped) {
+      logEvent(issue.id, 'cap_reached', {
+        from,
+        to: target,
+        round: capRound,
+        cap: incoming.round_cap,
+        reason: capReason,
+      });
+      return { from, to: target, capReached: true, reason: capReason };
+    }
+    logEvent(issue.id, 'transition', { from, to: target, ...(extra ?? {}) });
+    return { from, to: target, capReached: false };
   });
 }
 
@@ -71,34 +100,31 @@ export function transitionKickback(issueId: number): TransitionResult {
   const issue = getIssue(issueId);
   const cfg = getStateConfig(issue.status);
   if (!cfg.on_kickback) throw missingTransition(issue.status, 'on_kickback');
-  // Reset plan/code review counters when re-entering the code loop. They
-  // describe the *current* coding pass, not the issue's lifetime — leaving
-  // them at the prior cap value would force an immediate cap-trip on the next
-  // review/revise loop, eliding the safety net.
-  if (cfg.on_kickback === 'code') {
-    resetRoundCounters(issueId, ['plan_review_round', 'code_review_round']);
-    logEvent(issueId, 'rounds_reset_on_kickback', {
-      reset: ['plan_review_round', 'code_review_round'],
-    });
-  }
+  // move() handles the loop-counter reset when entering `code`/`plan`.
   return move(issue, cfg.on_kickback);
 }
 
 export function transitionNeedsInput(issueId: number, question: string): TransitionResult {
-  const issue = getIssue(issueId);
-  const cfg = getStateConfig(issue.status);
-  const target = cfg.on_needs_input ?? 'needs_input';
-  setStatus(issueId, target);
-  logEvent(issueId, 'needs_input', { from: issue.status, question });
-  return { from: issue.status, to: target, capReached: false };
+  return withTransaction(() => {
+    const issue = getIssue(issueId);
+    const cfg = getStateConfig(issue.status);
+    const target = cfg.on_needs_input ?? 'needs_input';
+    setStatus(issueId, target);
+    logEvent(issueId, 'needs_input', { from: issue.status, question });
+    return { from: issue.status, to: target, capReached: false };
+  });
 }
 
 export function transitionBlock(issueId: number, reason: string): TransitionResult {
-  const issue = getIssue(issueId);
-  setStatus(issueId, 'blocked');
-  logEvent(issueId, 'blocked', { from: issue.status, reason });
-  return { from: issue.status, to: 'blocked', capReached: false };
+  return withTransaction(() => {
+    const issue = getIssue(issueId);
+    setStatus(issueId, 'blocked');
+    logEvent(issueId, 'blocked', { from: issue.status, reason });
+    return { from: issue.status, to: 'blocked', capReached: false };
+  });
 }
+
+const COUNTER_BEARING: ReadonlySet<IssueStatus> = new Set(['plan_revise', 'code_revise', 'awaiting_human']);
 
 /** Manual force-set, bypassing on_* table. */
 export function transitionManual(issueId: number, to: IssueStatus, note?: string): TransitionResult {
@@ -107,10 +133,21 @@ export function transitionManual(issueId: number, to: IssueStatus, note?: string
       `unknown status '${to}'. Valid: ${Object.keys(STATES).join(', ')}`,
     );
   }
-  const issue = getIssue(issueId);
-  setStatus(issueId, to);
-  logEvent(issueId, 'manual', { from: issue.status, to, note });
-  return { from: issue.status, to, capReached: false };
+  // Refuse manual transitions into states that own a round counter — entering
+  // them via tix status would skip the counter bump and the cap check.
+  // Use the legitimate verbs (done / request-revision / kickback) instead.
+  if (COUNTER_BEARING.has(to)) {
+    throw new Error(
+      `refusing manual transition to '${to}' (round-counter-bearing state). ` +
+        `Use the appropriate workflow verb instead, or set status to a non-counter state first.`,
+    );
+  }
+  return withTransaction(() => {
+    const issue = getIssue(issueId);
+    setStatus(issueId, to);
+    logEvent(issueId, 'manual', { from: issue.status, to, note });
+    return { from: issue.status, to, capReached: false };
+  });
 }
 
 function missingTransition(status: IssueStatus, kind: 'on_done' | 'on_request_revision' | 'on_kickback'): Error {
@@ -127,21 +164,22 @@ function missingTransition(status: IssueStatus, kind: 'on_done' | 'on_request_re
  * so the next-agent kick-off can include it.
  */
 export function transitionResume(issueId: number, answer?: string): TransitionResult {
-  const issue = getIssue(issueId);
-  if (issue.status !== 'needs_input') {
-    throw new Error(`#${issueId} is not in needs_input (status=${issue.status})`);
-  }
-  const events = getEvents(issueId, 200);
-  const pause = events.find((e) => e.kind === 'needs_input');
-  if (!pause) throw new Error(`#${issueId} has no needs_input event to resume from`);
-  const fromState = parseFromField(pause.data) as IssueStatus | null;
-  if (!fromState) throw new Error(`#${issueId} needs_input event has no parseable from-state`);
-  if (answer) {
-    logEvent(issueId, 'human_answer', { answer });
-  }
-  setStatus(issueId, fromState);
-  logEvent(issueId, 'resumed', { to: fromState, with_answer: !!answer });
-  return { from: 'needs_input', to: fromState, capReached: false };
+  return withTransaction(() => {
+    const issue = getIssue(issueId);
+    if (issue.status !== 'needs_input') {
+      throw new Error(`#${issueId} is not in needs_input (status=${issue.status})`);
+    }
+    // Direct query for the most recent needs_input event — getEvents was
+    // capped at 200 which would miss it on long-running issues.
+    const pause = findLatestEvent(issueId, 'needs_input');
+    if (!pause) throw new Error(`#${issueId} has no needs_input event to resume from`);
+    const fromState = parseFromField(pause.data) as IssueStatus | null;
+    if (!fromState) throw new Error(`#${issueId} needs_input event has no parseable from-state`);
+    if (answer) logEvent(issueId, 'human_answer', { answer });
+    setStatus(issueId, fromState);
+    logEvent(issueId, 'resumed', { to: fromState, with_answer: !!answer });
+    return { from: 'needs_input', to: fromState, capReached: false };
+  });
 }
 
 function parseFromField(data: string | null): string | null {
